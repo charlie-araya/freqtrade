@@ -1,0 +1,92 @@
+
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "max_open_trades": 3,
+    "stake_currency": "USDT",
+    "stake_amount": "unlimited",
+    "amend_last_stake_amount": false,
+    "tradable_balance_ratio": 0.99,
+    "available_capital": 1000,
+    "fiat_display_currency": "USD",
+    "dry_run": true,
+    "dry_run_wallet": 1000,
+    "cancel_open_orders_on_exit": false,
+    "timeframe": "5m",
+    "trading_mode": "spot",
+    "margin_mode": "",
+    "unfilledtimeout": {
+        "entry": 10,
+        "exit": 10,
+        "exit_timeout_count": 0,
+        "unit": "minutes"
+    },
+    "entry_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1,
+        "price_last_balance": 0.0,
+        "check_depth_of_market": {
+            "enabled": false,
+            "bids_to_ask_delta": 1
+        }
+    },
+    "exit_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+    "exchange": {
+        "name": "lbank",
+        "key": "",
+        "secret": "",
+        "ccxt_config": {},
+        "ccxt_async_config": {},
+        "pair_whitelist": [
+            ".*/USDT"
+        ],
+        "pair_blacklist": [
+            "BUSD/USDT",
+            "USDC/USDT",
+            "TUSD/USDT",
+            "PAX/USDT",
+            "DAI/USDT",
+            "EUR/USDT",
+            "GBP/USDT"
+        ]
+    },
+    "pairlists": [
+        {
+            "method": "VolumePairList",
+            "number_assets": 30,
+            "sort_key": "quoteVolume",
+            "min_value": 0
+        }        
+    ],
+    "telegram": {
+        "enabled": false,
+        "token": "",
+        "chat_id": "",
+        "notification_settings": {
+            "status": "on"
+        }
+    },
+    "api_server": {
+        "enabled": true,
+        "listen_ip_address": "127.0.0.1",
+        "listen_port": 8080,
+        "verbosity": "error",
+        "enable_openapi": false,
+        "jwt_secret_key": "81b2faf5e88fc3e28733b807d9905ab6c78256617c3ee4301c22afa6cbd7c3f8",
+        "ws_token": "jT7-F20Lnweba_9MhZhI_mbQLDRchUaWlQ",
+        "CORS_origins": [],
+        "username": "frequser",
+        "password": "super_secure_password_change_me"
+    },
+    "bot_name": "freqtrade_production_bot",
+    "initial_state": "running",
+    "force_entry_enable": false,
+    "db_url": "sqlite:///tradesv3.sqlite",
+    "internals": {
+        "process_throttle_secs": 5
+    }
+}
