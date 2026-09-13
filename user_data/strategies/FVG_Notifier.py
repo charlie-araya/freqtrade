@@ -46,6 +46,19 @@ def _restore_cursor() -> None:
     sys.stdout.flush()
 
 
+def _format_volume(vol: float | None) -> str:
+    """Format a 24h quote volume (e.g. 359.5M, 1.24M, 650K). Returns '-' when unknown."""
+    if not vol or vol != vol:  # None or NaN
+        return "-"
+    if vol >= 1e9:
+        return f"{vol / 1e9:.2f}B"
+    if vol >= 1e6:
+        return f"{vol / 1e6:.2f}M"
+    if vol >= 1e3:
+        return f"{vol / 1e3:.1f}K"
+    return f"{vol:.0f}"
+
+
 def pine_swing_highs_lows(dataframe: pd.DataFrame, size: int = 50) -> pd.DataFrame:
     """
     Replicates the swing high/low logic of the LuxAlgo 'Smart Money Concepts'
@@ -304,6 +317,8 @@ class FVG_Notifier(IStrategy):
         self.pair_metrics: dict[str, dict] = {}
         # Last printed scoreboard string, to avoid re-printing identical tables.
         self._last_scoreboard: str | None = None
+        # 24h quote volume per pair, refreshed once per bot loop (see bot_loop_start).
+        self._vol24h: dict[str, float] = {}
 
     def populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
         """
@@ -445,10 +460,11 @@ class FVG_Notifier(IStrategy):
                 short_pair,
                 f"{m['ratio']:.2f}",
                 f"{m['high']}/{m['low']}",
+                _format_volume(self._vol24h.get(m['pair'])),
             ])
         frame = tabulate(
             rows,
-            headers=["Pair", "Ratio", "High/Low"],
+            headers=["Pair", "Ratio", "High/Low", "24H Vol"],
             tablefmt="github",
         )
 
@@ -483,6 +499,15 @@ class FVG_Notifier(IStrategy):
         #    return
         
         if self.dp and self.dp.runmode.value in ('live', 'dry_run'):
+            # Refresh 24h quote volume once per bot loop and cache it, so the
+            # scoreboard never triggers repeated network calls. dp.ticker()
+            # returns {} on error; the previous value is then kept.
+            for pair in self.pair_metrics:
+                ticker = self.dp.ticker(pair)
+                vol = ticker.get('quoteVolume') if ticker else None
+                if vol is not None:
+                    self._vol24h[pair] = float(vol)
+
             self._print_scoreboard()
 
             # Send a single Telegram notification
