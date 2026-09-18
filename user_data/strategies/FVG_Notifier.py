@@ -1,9 +1,10 @@
 """
 SMC Fair Value Gap (FVG) Notification Strategy for Freqtrade
 
-This strategy detects Fair Value Gaps (FVG) on a 1-minute timeframe using the
-`smartmoneyconcepts` library and sends real-time Telegram notifications when a new FVG
-forms on the latest closed candle.
+The strategy tracks SMC swing structure, TRAMA(99)/HMA(21) and MACD on the
+15-minute base timeframe, notifying through the configured alert channel
+(RPC/Telegram) and the log when the latest closed candle prints an HMA/TRAMA
+cross or a MACD/signal cross.
 """
 
 import atexit
@@ -11,6 +12,7 @@ import logging
 import os
 import re
 import sys
+import time
 import pandas as pd
 from freqtrade.strategy import IStrategy
 from datetime import datetime
@@ -19,6 +21,12 @@ from pydantic import BaseModel, Field
 import numpy as np
 from tabulate import tabulate
 
+# Technical analysis library (talib.abstract for MACD + HMA/WMA).
+try:
+    import talib.abstract as ta
+except ImportError:  # pragma: no cover
+    ta = None
+
 # Import Smart Money Concepts library
 try:
     from smartmoneyconcepts import smc
@@ -26,24 +34,6 @@ except ImportError:
     smc = None
 
 logger = logging.getLogger(__name__)
-
-
-def _enable_vt() -> None:
-    """Enable ANSI/VT escape sequence processing on the Windows console."""
-    if os.name == "nt":
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-        mode = ctypes.c_uint32()
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
-
-
-def _restore_cursor() -> None:
-    """Re-show the terminal cursor on process exit."""
-    sys.stdout.write("\033[?25h")
-    sys.stdout.flush()
 
 
 def _format_volume(vol: float | None) -> str:
@@ -57,6 +47,82 @@ def _format_volume(vol: float | None) -> str:
     if vol >= 1e3:
         return f"{vol / 1e3:.1f}K"
     return f"{vol:.0f}"
+
+
+def _wma(series: pd.Series, length: int) -> pd.Series:
+    """Weighted moving average matching Pine's ta.wma (most recent value has the largest weight)."""
+    if length < 1:
+        return series.astype(float)
+    weights = np.arange(1, length + 1, dtype=float)
+
+    def _calc(window: np.ndarray) -> float:
+        return float(np.dot(window, weights) / weights.sum())
+
+    return series.rolling(length, min_periods=length).apply(_calc, raw=True)
+
+
+def hma(dataframe: pd.DataFrame, length: int = 21) -> pd.Series:
+    """
+    Hull Moving Average matching Pine's ta.hma:
+    WMA(2 * WMA(close, floor(length/2)) - WMA(close, length), round(sqrt(length))).
+
+    Uses talib's HMA function when available; talib 0.7.x only ships WMA, so the
+    same canonical formula is composed from ta.WMA. Falls back to a pure-pandas
+    WMA if talib is not installed.
+    """
+    close = dataframe['close']
+    half = max(1, length // 2)
+    sq = max(1, int(round(np.sqrt(length))))
+    if ta is not None:
+        if hasattr(ta, 'HMA'):
+            return pd.Series(ta.HMA(close, timeperiod=length), index=close.index)
+        fast = pd.Series(ta.WMA(close, timeperiod=half), index=close.index)
+        slow = pd.Series(ta.WMA(close, timeperiod=length), index=close.index)
+        raw = 2.0 * fast - slow
+        return pd.Series(ta.WMA(raw, timeperiod=sq), index=close.index)
+    fast = _wma(close, half)
+    slow = _wma(close, length)
+    raw = 2.0 * fast - slow
+    return _wma(raw, sq)
+
+
+def trama(dataframe: pd.DataFrame, length: int = 99) -> pd.Series:
+    """
+    TRAMA (LuxAlgo) port of the Pine source:
+
+        hh = max(sign(change(highest(length))), 0)
+        ll = max(sign(-change(lowest(length))), 0)
+        tc = sma((hh > 0 or ll > 0) ? 1 : 0, length) ^ 2
+        ama := nz(ama[1] + tc * (src - ama[1]), src)
+
+    Rolling windows include the current bar (ta.highest/ta.lowest/ta.sma), and the
+    extremes come from the HIGH (ta.highest) and LOW (ta.lowest) series, while the
+    recursion source defaults to CLOSE (trama_src). During the warm-up, where tc is
+    na, ama falls back to the source value (Pine's nz).
+    """
+    close = dataframe['close']
+    high = dataframe['high']
+    low = dataframe['low']
+    highest = high.rolling(length, min_periods=length).max()
+    lowest = low.rolling(length, min_periods=length).min()
+
+    # 1 when highest made a new high (hh) or a new lower low was made (ll).
+    hh = (highest.diff() > 0).astype(float)
+    ll = (lowest.diff() < 0).astype(float)
+    cond = ((hh + ll) > 0).astype(float)
+    tc = cond.rolling(length, min_periods=length).mean() ** 2
+
+    c = close.to_numpy(dtype=float)
+    t = tc.to_numpy(dtype=float)
+    ama = np.empty(len(close), dtype=float)
+    ama[0] = c[0]
+    for i in range(1, len(close)):
+        if np.isnan(t[i]):
+            ama[i] = c[i]
+        else:
+            ama[i] = ama[i - 1] + t[i] * (c[i] - ama[i - 1])
+
+    return pd.Series(ama, index=dataframe.index)
 
 
 def pine_swing_highs_lows(dataframe: pd.DataFrame, size: int = 50) -> pd.DataFrame:
@@ -117,129 +183,6 @@ def pine_swing_highs_lows(dataframe: pd.DataFrame, size: int = 50) -> pd.DataFra
 
     return pd.DataFrame({"HighLow": highlow, "Level": level})
 
-
-def dynamic_delta_fvg(
-    dataframe: pd.DataFrame,
-    atr_mult: float = 0.2,
-    vol_mult: float = 0.0,
-    mit_mode: str = 'touch',
-    filter_overlap: bool = True,
-    atr_period: int = 14,
-    vol_period: int = 20,
-) -> pd.DataFrame:
-    """
-    Port of the LuxAlgo 'Dynamic Delta FVG' detection logic.
-
-    A gap is detected at the CURRENT bar i (only on confirmed candles in Pine,
-    which maps to rows < len(dataframe) here) when bar i is separated from bar
-    i-2:
-
-      bullish: low[i]   > high[i-2]   -> top=low[i],     bottom=high[i-2]
-      bearish: high[i]  <  low[i-2]   -> top=low[i-2],   bottom=high[i]
-
-    Filters (Pine defaults):
-      - volume: volume[i-1] >= SMA(volume, 20)[i-1] * vol_mult   (0 = disabled)
-      - size:   gap depth >= ATR(14) * atr_mult
-      - overlap: when a new gap overlaps an older unmitigated gap, the older one
-        is removed (only the most recent imbalance in a zone stays active).
-
-    Mitigation ('touch' = gap borders touched, 'full' = fully filled):
-      - bullish gap mitigated the first bar j>i with low[j]  < level
-      - bearish gap mitigated the first bar j>i with high[j] > level
-
-    Volume delta uses the Pine fallback (no lower-TF data): candle direction
-    (close>open -> 100% buy). The delta shown belongs to bar i-1 (buyPct[1]).
-
-    Returns a DataFrame with columns:
-      FVG (1 bullish, -1 bearish, NaN), Top, Bottom, MitigatedIndex
-      (0 = unmitigated, else bar index that filled it), Active (post
-      mitigation + overlap filtering), BuyPct, SellPct.
-    """
-    df = dataframe
-    n = len(df)
-
-    # ATR with Wilder smoothing; fall back to TR on early bars (nz(ta.atr, ta.tr)).
-    prev_close = df['close'].shift(1)
-    tr = pd.concat(
-        [df['high'] - df['low'],
-         (df['high'] - prev_close).abs(),
-         (df['low'] - prev_close).abs()],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.ewm(alpha=1.0 / atr_period, adjust=False).mean().fillna(tr)
-
-    vol_avg = df['volume'].rolling(vol_period).mean()
-
-    is_bull = df['low'] > df['high'].shift(2)
-    is_bear = df['high'] < df['low'].shift(2)
-    # vol_mult == 0 disables the volume filter in Pine; any other value gates on
-    # volume[1] >= SMA(volume, vol_period)[1] * vol_mult.
-    if vol_mult == 0:
-        vol_filter = pd.Series(True, index=df.index)
-    else:
-        vol_filter = df['volume'].shift(1) >= vol_avg.shift(1) * vol_mult
-    size_bull = (df['low'] - df['high'].shift(2)) >= atr * atr_mult
-    size_bear = (df['low'].shift(2) - df['high']) >= atr * atr_mult
-
-    bull = is_bull & vol_filter & size_bull
-    bear = is_bear & vol_filter & size_bear
-
-    fvg = np.where(bull, 1.0, np.where(bear, -1.0, np.nan))
-    top = np.where(bull, df['low'], np.where(bear, df['low'].shift(2), np.nan))
-    bottom = np.where(bull, df['high'].shift(2), np.where(bear, df['high'], np.nan))
-
-    # Volume delta (Pine fallback: candle direction of the previous bar).
-    delta_buy = np.full(n, 100.0)
-    close_arr = df['close'].to_numpy()
-    open_arr = df['open'].to_numpy()
-    delta_buy[close_arr < open_arr] = 0.0
-    delta_buy[close_arr == open_arr] = 50.0
-    buy_pct = pd.Series(delta_buy, index=df.index).shift(1)
-    sell_pct = 100.0 - buy_pct
-
-    # Mitigation.
-    low_arr = df['low'].to_numpy()
-    high_arr = df['high'].to_numpy()
-    touch = mit_mode == 'touch'
-    mitigated_index = np.zeros(n, dtype=np.int32)
-    det = np.flatnonzero(~np.isnan(fvg))
-    for i in det:
-        if fvg[i] == 1.0:
-            level = top[i] if touch else bottom[i]
-            hits = np.flatnonzero(low_arr[i + 1:] < level)
-        else:
-            level = bottom[i] if touch else top[i]
-            hits = np.flatnonzero(high_arr[i + 1:] > level)
-        if hits.size:
-            mitigated_index[i] = int(i + 1 + hits[0])
-
-    # Overlap filtering (optional): remove a gap when any LATER detected gap
-    # overlaps its price zone, so only the most recent imbalance in a zone stays
-    # active (Pine's filterOverlapInput).
-    active_det = np.ones(len(det), dtype=bool)
-    if filter_overlap:
-        for a in range(len(det)):
-            i = det[a]
-            for b in range(a + 1, len(det)):
-                j = det[b]
-                if max(bottom[i], bottom[j]) < min(top[i], top[j]):
-                    active_det[a] = False
-                    break
-    active_det &= mitigated_index[det] == 0
-
-    active_out = np.zeros(n, dtype=bool)
-    active_out[det] = active_det
-
-    return pd.DataFrame({
-        'FVG': fvg,
-        'Top': top,
-        'Bottom': bottom,
-        'MitigatedIndex': np.where(np.isnan(fvg), np.nan, mitigated_index),
-        'Active': active_out,
-        'BuyPct': buy_pct,
-        'SellPct': sell_pct,
-    })
-
 class SMCAlert(BaseModel):
     """
     Pydantic model representing a smart money concept alert data structure.
@@ -282,7 +225,16 @@ class FVG_Notifier(IStrategy):
         "0": 100
     }
     stoploss = -0.99
-    startup_candle_count = 100  # Ensures adequate historical candles for SMC calculations
+    # TRAMA needs 99 bars on the 15m base timeframe; 200 candles give margin
+    # over that warm-up (and the HMA/MACD lookbacks are well inside it).
+    startup_candle_count = 200
+
+    # Base-timeframe indicator settings for the crossover notifications.
+    hma_length = 21
+    trama_length = 99
+    macd_fast = 12
+    macd_slow = 26
+    macd_signal = 9
 
     # Minimum seconds to wait before sending another FVG alert for the same pair.
     # Prevents the Telegram bot from being saturated when a forming FVG repaints or
@@ -295,13 +247,11 @@ class FVG_Notifier(IStrategy):
     # candles have followed it without exceeding it.
     swing_size = 50
 
-    # Dynamic Delta FVG detection filters (LuxAlgo 'Dynamic Delta FVG' defaults).
-    fvg_atr_mult = 0.2          # min gap depth as a multiple of ATR(14)
-    fvg_vol_mult = 0.0          # min previous-bar volume vs SMA(20); 0 = disabled
-    fvg_mit_mode = 'touch'      # 'touch' = borders touched, 'full' = fully filled
-    fvg_filter_overlap = True   # keep only the most recent gap in a price zone
-    fvg_atr_period = 14
-    fvg_vol_period = 20
+    notification_whitelist: list[str] = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ZEC/USDT']  # Only listed pairs are notified.
+
+    # Minimum number of minutes between scoreboard prints. Can be overridden from
+    # the strategy config with the "scoreboard_interval_minutes" key.
+    scoreboard_interval_minutes = 15
 
     def __init__(self, config: dict) -> None:
         super().__init__(config)
@@ -319,11 +269,85 @@ class FVG_Notifier(IStrategy):
         self._last_scoreboard: str | None = None
         # 24h quote volume per pair, refreshed once per bot loop (see bot_loop_start).
         self._vol24h: dict[str, float] = {}
+        # Epoch-second deadline for the next scoreboard print (see bot_loop_start).
+        now = time.time()
+        self._next_scoreboard_print = now + 2 * 60.0
+        # Base-candle timestamps of the last HMA/TRAMA and MACD cross alerts per
+        # pair, so a single cross produces exactly one notification.
+        self._last_hma_cross_alert: dict[str, pd.Timestamp] = {}
+        self._last_macd_cross_alert: dict[str, pd.Timestamp] = {}
+
+    def _check_hma_trama_cross(self, pair: str, dataframe: pd.DataFrame) -> None:
+        """
+        Notifies when HMA(21) crosses above/below TRAMA(99) on the LATEST CLOSED
+        base candle (iloc[-2]; iloc[-1] is still forming). One notification per
+        crossed candle.
+        """
+        if len(dataframe) < 3:
+            return
+        h = dataframe['hma']
+        t = dataframe['trama']
+        i = -2
+        h_i, t_i = h.iloc[i], t.iloc[i]
+        h_j, t_j = h.iloc[i - 1], t.iloc[i - 1]
+        if pd.isna(h_i) or pd.isna(t_i) or pd.isna(h_j) or pd.isna(t_j):
+            return
+
+        crossed_up = h_i > t_i and h_j <= t_j
+        crossed_down = h_i < t_i and h_j >= t_j
+        if crossed_up == crossed_down:
+            return
+
+        candle_time = dataframe['date'].iloc[i]
+        if self._last_hma_cross_alert.get(pair) == candle_time:
+            return
+
+        msg = (
+            f"{pair}: HMA crossed {'above' if crossed_up else 'below'} TRAMA "
+            f"({self.timeframe}): HMA {h_i:.2f} vs TRAMA {t_i:.2f}"
+        )
+        logger.info(msg)
+        #if self.dp:
+        #    self.dp.send_msg(msg)
+        self._last_hma_cross_alert[pair] = candle_time
+
+    def _check_macd_cross(self, pair: str, dataframe: pd.DataFrame) -> None:
+        """
+        Notifies when MACD crosses above/below its signal line on the LATEST
+        CLOSED base candle. One notification per crossed candle.
+        """
+        if len(dataframe) < 3:
+            return
+        m = dataframe['macd']
+        s = dataframe['macdsignal']
+        i = -2
+        m_i, s_i = m.iloc[i], s.iloc[i]
+        m_j, s_j = m.iloc[i - 1], s.iloc[i - 1]
+        if pd.isna(m_i) or pd.isna(s_i) or pd.isna(m_j) or pd.isna(s_j):
+            return
+
+        crossed_up = m_i > s_i and m_j <= s_j
+        crossed_down = m_i < s_i and m_j >= s_j
+        if crossed_up == crossed_down:
+            return
+
+        candle_time = dataframe['date'].iloc[i]
+        if self._last_macd_cross_alert.get(pair) == candle_time:
+            return
+
+        msg = (
+            f"{pair}: MACD crossed {'above' if crossed_up else 'below'} signal "
+            f"({self.timeframe}): MACD {m_i:.4f} vs Signal {s_i:.4f}"
+        )
+        logger.info(msg)
+        #if self.dp:
+        #    self.dp.send_msg(msg)
+        self._last_macd_cross_alert[pair] = candle_time
 
     def populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
         """
-        Calculates Fair Value Gaps using the smartmoneyconcepts library and fires
-        Telegram alerts for newly formed gaps on the latest closed candle.
+        Computes TRAMA(99), HMA(21) and MACD on the 15m base dataframe and fires
+        notifications on HMA/TRAMA and MACD/signal crosses (last closed candle).
         """
         if smc is None:
             return dataframe
@@ -334,40 +358,25 @@ class FVG_Notifier(IStrategy):
         
         pair = metadata.get('pair', 'Unknown Pair')
 
-        # ---------------------------------------------------------------------
-        # 1m timeframe FVG counts (base timeframe)
-        # ---------------------------------------------------------------------
-        fvg_df = dynamic_delta_fvg(
-            dataframe,
-            atr_mult=self.fvg_atr_mult,
-            vol_mult=self.fvg_vol_mult,
-            mit_mode=self.fvg_mit_mode,
-            filter_overlap=self.fvg_filter_overlap,
-            atr_period=self.fvg_atr_period,
-            vol_period=self.fvg_vol_period,
-        )
-
-        fvg = fvg_df['FVG'].iloc[-1]
-        if fvg in [1, -1]:
-            logger.info(f"Pair {pair}: has new FVG")
-
-
-        # Active gaps = detected, unmitigated and not overlapped by a later gap.
-        dataframe['bullish_fvg_count'] = (
-            (fvg_df['FVG'] == 1) & fvg_df['Active']).astype(int)
-        dataframe['bearish_fvg_count'] = (
-            (fvg_df['FVG'] == -1) & fvg_df['Active']).astype(int)
-
-        # Total confirmed, unmitigated FVGs (both directions) per base candle.
-        dataframe['fvg_total_count'] = (
-            dataframe['bullish_fvg_count'] + dataframe['bearish_fvg_count'])
+        if pair in self.notification_whitelist:
+            logger.info(f"Processing {pair} for SMC indicators and notifications.")
+            # ---------------------------------------------------------------------
+            # Base timeframe (15m) indicators: TRAMA(99), HMA(21), MACD
+            # ---------------------------------------------------------------------
+            dataframe['trama'] = trama(dataframe, self.trama_length)
+            dataframe['hma'] = hma(dataframe, self.hma_length)
+            self._check_hma_trama_cross(pair, dataframe)
+            if ta is not None:
+                macd = ta.MACD(dataframe)
+                dataframe['macd'] = macd['macd']
+                dataframe['macdsignal'] = macd['macdsignal']
+                dataframe['macdhist'] = macd['macdhist']
+                self._check_macd_cross(pair, dataframe)
+            
 
         # Pine-style (LuxAlgo) swing high/low detection - see pine_swing_highs_lows.
         swing_df = pine_swing_highs_lows(dataframe, size=self.swing_size)
-        #ob_df = smc.ob(dataframe, swing_df)
 
-        # Define lookback window
-        n = 12
 
         # ---------------------------------------------------------------------
         # Swing High and Low Detection
@@ -402,13 +411,11 @@ class FVG_Notifier(IStrategy):
 
         # Count of confirmed, unmitigated FVGs during the last CLOSED base candle
         # (iloc[-2]; iloc[-1] is the still-forming candle).
-        fvg_count = int(dataframe['fvg_total_count'].iloc[-1])
         ratio = float(dataframe['swing_range_percentage'].iloc[-1])
         high = float(dataframe['latest_swing_high'].iloc[-1])
         low = float(dataframe['latest_swing_low'].iloc[-1])
         self.pair_metrics[pair] = {
             'pair': pair,
-            'fvg_count': fvg_count,
             'ratio': round(ratio, 2),
             'high': high,
             'low': low,
@@ -448,47 +455,34 @@ class FVG_Notifier(IStrategy):
 
         On a real terminal the table is redrawn in place (top-like behavior):
         the screen is cleared and rewritten on every bot loop. The same table is
-        mirrored to the log file only when its content actually changes, to avoid
-        spamming the log on every throttle tick.
+        normally mirrored to the log file only when its content actually changes,
+        to avoid spamming the log on every throttle tick. Setting ``force`` makes
+        it log unconditionally; the periodic timer in bot_loop_start uses that so
+        the scoreboard is printed at regular intervals even when nothing moved.
         """
         rows = []
         for m in sorted(
-            self.pair_metrics.values(), key=lambda x: (x['ratio'], x['fvg_count']), reverse=True
+            self.pair_metrics.values(), key=lambda x: (self._vol24h.get(x['pair']), x['ratio']), reverse=True
         ):
             short_pair = re.sub('/.*', '', m['pair'])
             rows.append([
                 short_pair,
+                _format_volume(self._vol24h.get(m['pair'])),
                 f"{m['ratio']:.2f}",
                 f"{m['high']}/{m['low']}",
-                _format_volume(self._vol24h.get(m['pair'])),
+                
             ])
-        frame = tabulate(
-            rows,
-            headers=["Pair", "Ratio", "High/Low", "24H Vol"],
-            tablefmt="github",
-        )
 
-        if frame != self._last_scoreboard:
-            if sys.stdout.isatty():
-                header = (
-                    f"SMC Scoreboard  {self.get_ny_time()}  "
-                    f"timeframe={self.timeframe}  pairs={len(rows)}"
-                )
-                self._render_top(header, frame)
+        if rows:
+            frame = tabulate(
+                rows,
+                headers=["Pair", "24H Vol", "Ratio", "High/Low"],
+                tablefmt="github",
+            )
 
-            self._last_scoreboard = frame
-            logger.info(f"SMC Scoreboard ({self.get_ny_time()} {self.timeframe}):\n{frame}")
-
-    def _render_top(self, header: str, body: str) -> None:
-        """Redraw the terminal in place (top-style) with the given frame."""
-        if not getattr(self, "_top_initialized", False):
-            _enable_vt()
-            sys.stdout.write("\033[?25l")
-            sys.stdout.flush()
-            atexit.register(_restore_cursor)
-            self._top_initialized = True
-        sys.stdout.write(f"\033[2J\033[H{header}\n\n{body}\n")
-        sys.stdout.flush()
+            if frame != self._last_scoreboard:
+                self._last_scoreboard = frame
+                logger.info(f"SMC Scoreboard ({self.get_ny_time()} {self.timeframe}):\n{frame}")
 
     def bot_loop_start(self, **kwargs) -> None:
         """
@@ -508,20 +502,20 @@ class FVG_Notifier(IStrategy):
                 if vol is not None:
                     self._vol24h[pair] = float(vol)
 
-            self._print_scoreboard()
-
-            # Send a single Telegram notification
-            # Sort Pydantic FVGAlert objects by gap percentage descending
-            #self.pending_smc_alerts.sort(key=lambda x: x.percentage, reverse=True)
-
-            # Format entries into Markdown strings
-            #formatted_alerts = [alert.format_entry() for alert in self.pending_smc_alerts]
-
-            # Build a single unified message        
-            #header = f"{self.get_ny_time()} {self.timeframe}\n"
-            #combined_body = header + "\n".join(formatted_alerts)
-
-            #self.dp.send_msg(combined_body)
+            # Print the scoreboard at most once every N minutes (N = interval_minutes),
+            # regardless of how fast the bot loop throttles.
+            interval_minutes = float(
+                self.config.get('scoreboard_interval_minutes', self.scoreboard_interval_minutes)
+            )
+            now = time.time()
+            if now >= self._next_scoreboard_print:
+                # The very first loop prints immediately (i.e. on app start once
+                # the pair metrics are available), and the interval is then
+                # counted from that print: every N minutes the scoreboard is
+                # re-printed even if its content did not change.
+                self._print_scoreboard()
+                self._next_scoreboard_print = now + interval_minutes * 60.0
 
         # Clear the queue for the next loop
         self.pending_smc_alerts.clear()
+ 
