@@ -218,7 +218,7 @@ class FVG_Notifier(IStrategy):
     # Processing options
     process_only_new_candles = True
     use_exit_signal = False
-    timeframe = '15m'
+    timeframe = '1h'
     
     # Minimal ROI and Stoploss (Placeholders required by Freqtrade IStrategy)
     minimal_roi = {
@@ -271,7 +271,7 @@ class FVG_Notifier(IStrategy):
         self._vol24h: dict[str, float] = {}
         # Epoch-second deadline for the next scoreboard print (see bot_loop_start).
         now = time.time()
-        self._next_scoreboard_print = now + 2 * 60.0
+        self._next_scoreboard_print = now + 1 * 60.0
         # Base-candle timestamps of the last HMA/TRAMA and MACD cross alerts per
         # pair, so a single cross produces exactly one notification.
         self._last_hma_cross_alert: dict[str, pd.Timestamp] = {}
