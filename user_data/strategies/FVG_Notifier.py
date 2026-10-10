@@ -253,6 +253,15 @@ class FVG_Notifier(IStrategy):
     # the strategy config with the "scoreboard_interval_minutes" key.
     scoreboard_interval_minutes = 15
 
+    # Highlighting tiers for top coins by Ratio (terminal only, ANSI). 0 disables.
+    # Tier 1: yellow background, black font for the very top coins.
+    top_ratio_tier1_count = 10
+    # Tier 2: white background, black font for the next coins after tier 1.
+    top_ratio_tier2_count = 20
+
+    # Scoreboard sort order: 'ratio' or 'volume'. Defaults to 'ratio'.
+    scoreboard_sort_order = 'ratio'
+
     def __init__(self, config: dict) -> None:
         super().__init__(config)
         if smc is None:
@@ -271,7 +280,14 @@ class FVG_Notifier(IStrategy):
         self._vol24h: dict[str, float] = {}
         # Epoch-second deadline for the next scoreboard print (see bot_loop_start).
         now = time.time()
-        self._next_scoreboard_print = now + 1 * 60.0
+        self._next_scoreboard_print = now + 0.5 * 60.0
+        # Scoreboard sort order resolved from config/env (default 'ratio').
+        so = (os.environ.get('FVG_SCOREBOARD_SORT_ORDER')
+              or self.config.get('scoreboard_sort_order')
+              or self.scoreboard_sort_order
+              or 'ratio')
+        so = str(so).strip().lower()
+        self._scoreboard_sort_order = 'volume' if so == 'volume' else 'ratio'
         # Base-candle timestamps of the last HMA/TRAMA and MACD cross alerts per
         # pair, so a single cross produces exactly one notification.
         self._last_hma_cross_alert: dict[str, pd.Timestamp] = {}
@@ -404,6 +420,7 @@ class FVG_Notifier(IStrategy):
         dataframe['swing_range_percentage'] = (
             (dataframe['latest_swing_high'] - dataframe['latest_swing_low']) / dataframe['latest_swing_low']
         ) * 100
+        dataframe['swing_range_percentage'] = dataframe['swing_range_percentage'].fillna(0.0).replace([float('inf'), float('-inf')], 0.0)
 
         # ---------------------------------------------------------------------
         # Per-pair scoreboard metric
@@ -414,6 +431,7 @@ class FVG_Notifier(IStrategy):
         ratio = float(dataframe['swing_range_percentage'].iloc[-1])
         high = float(dataframe['latest_swing_high'].iloc[-1])
         low = float(dataframe['latest_swing_low'].iloc[-1])
+        
         self.pair_metrics[pair] = {
             'pair': pair,
             'ratio': round(ratio, 2),
@@ -461,9 +479,19 @@ class FVG_Notifier(IStrategy):
         the scoreboard is printed at regular intervals even when nothing moved.
         """
         rows = []
-        for m in sorted(
-            self.pair_metrics.values(), key=lambda x: (self._vol24h.get(x['pair']), x['ratio']), reverse=True
-        ):
+        if self._scoreboard_sort_order == 'volume':
+            sorted_metrics = sorted(
+                self.pair_metrics.values(),
+                key=lambda x: (self._vol24h.get(x['pair']) or 0.0, x.get('ratio') or 0.0),
+                reverse=True,
+            )
+        else:
+            sorted_metrics = sorted(
+                self.pair_metrics.values(),
+                key=lambda x: (x.get('ratio') or 0.0, self._vol24h.get(x['pair']) or 0.0),
+                reverse=True,
+            )
+        for m in sorted_metrics:
             short_pair = re.sub('/.*', '', m['pair'])
             rows.append([
                 short_pair,
@@ -479,10 +507,72 @@ class FVG_Notifier(IStrategy):
                 headers=["Pair", "24H Vol", "Ratio", "High/Low"],
                 tablefmt="github",
             )
+            #frame = self._apply_ratio_highlight(frame, rows)
 
             if frame != self._last_scoreboard:
                 self._last_scoreboard = frame
                 logger.info(f"SMC Scoreboard ({self.get_ny_time()} {self.timeframe}):\n{frame}")
+
+    def _apply_ratio_highlight(self, frame: str, rows: list) -> str:
+        """
+        Highlights the Ratio cell (terminal only) for the top coins sorted by Ratio:
+        - Tier 1 (top N): yellow background, black font.
+        - Tier 2 (next M): white background, black font.
+        Log files are left unchanged.
+        """
+        tier1 = int(self.config.get('top_ratio_tier1_count', self.top_ratio_tier1_count))
+        tier2 = int(self.config.get('top_ratio_tier2_count', self.top_ratio_tier2_count))
+        if tier1 <= 0 and tier2 <= 0:
+            return frame
+        try:
+            if not (sys.stdout.isatty() or sys.stderr.isatty()):
+                return frame
+        except Exception:
+            return frame
+
+        ranked = sorted(
+            (m for m in self.pair_metrics.values()
+             if isinstance(m.get('ratio'), (int, float)) and m.get('ratio') == m.get('ratio')),
+            key=lambda m: m['ratio'],
+            reverse=True,
+        )
+        top_by_tier: dict[str, str] = {}
+        for i, m in enumerate(ranked):
+            short = re.sub('/.*', '', m['pair'])
+            if i < tier1 and tier1 > 0:
+                top_by_tier[short] = 'Y'
+            elif tier1 <= i < tier1 + tier2 and tier2 > 0:
+                top_by_tier[short] = 'W'
+
+        if not top_by_tier:
+            return frame
+
+        ansi_y = "\x1b[43;30m"  # yellow bg, black fg
+        ansi_w = "\x1b[47;30m"  # white bg, black fg
+        ansi_z = "\x1b[0m"
+        out = []
+        for line in frame.split('\n'):
+            if not line.startswith('| ') or line.startswith('|-'):
+                out.append(line)
+                continue
+            cells = line.split('|')
+            body = [c for c in cells[1:-1]]
+            if len(body) < 4 or body[0].strip() not in top_by_tier:
+                out.append(line)
+                continue
+            ratio_cell = body[2]
+            pad_l = len(ratio_cell) - len(ratio_cell.lstrip(' '))
+            pad_r = len(ratio_cell) - len(ratio_cell.rstrip(' '))
+            color = ansi_y if top_by_tier[body[0].strip()] == 'Y' else ansi_w
+            new_body = []
+            for i, c in enumerate(body):
+                if i == 2:
+                    new_body.append((' ' * pad_l) + color + ratio_cell.strip() + ansi_z + (' ' * pad_r))
+                else:
+                    new_body.append(c)
+            out.append('|'.join([''] + new_body + ['']))
+            continue
+        return '\n'.join(out)
 
     def bot_loop_start(self, **kwargs) -> None:
         """

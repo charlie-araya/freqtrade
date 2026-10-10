@@ -34,10 +34,30 @@ Set-Location -LiteralPath $ProjectRoot
 
 # Run freqtrade using the activated environment; fall back to the venv executable
 # if activation was blocked (e.g. by execution policy).
+
+# Optional: scoreboard_sort_order can be passed as first positional argument (volume|ratio)
+$ScoreboardSortOrder = "volume"
+$ExtraArgs = @()
+foreach ($a in $args) {
+    $ExtraArgs += $a
+}
+
+# Simple positional override: first arg is sort order if it matches allowed values
+if ($ExtraArgs.Count -ge 1) {
+    $first = $ExtraArgs[0].ToString().ToLowerInvariant()
+    if ($first -eq "volume" -or $first -eq "ratio") {
+        $ScoreboardSortOrder = $first
+        $ExtraArgs = $ExtraArgs[1..($ExtraArgs.Count - 1)]
+    }
+}
+
+# Export to environment so the strategy can read it
+$env:FVG_SCOREBOARD_SORT_ORDER = $ScoreboardSortOrder
+
 if (Get-Command freqtrade -ErrorAction SilentlyContinue) {
-    freqtrade trade -c $Config --strategy FVG_Notifier @args
+    freqtrade trade -c $Config --strategy FVG_Notifier @ExtraArgs
 } else {
-    & (Join-Path $VenvDir 'Scripts\freqtrade.exe') trade -c $Config --strategy FVG_Notifier @args
+    & (Join-Path $VenvDir 'Scripts\freqtrade.exe') trade -c $Config --strategy FVG_Notifier @ExtraArgs
 }
 
 exit $LASTEXITCODE

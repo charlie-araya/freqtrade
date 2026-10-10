@@ -12,6 +12,10 @@
             }
         },
         "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "default"
+            },
             "file": {
                 "class": "logging.handlers.RotatingFileHandler",
                 "formatter": "default",
@@ -22,6 +26,7 @@
         },
         "root": {
             "handlers": [
+                "console",
                 "file"
             ],
             "level": "INFO"
@@ -80,13 +85,13 @@
     "pairlists": [
         {
             "method": "VolumePairList",
-            "number_assets": 50,
+            "number_assets": 80,
             "sort_key": "quoteVolume",
-            "min_value": 400000
+            "min_value": 0
         }        
     ],
     "telegram": {
-        "enabled": false,
+        "enabled": true,
         "token": "",
         "chat_id": "",
         "notification_settings": {

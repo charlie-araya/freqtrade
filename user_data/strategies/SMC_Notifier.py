@@ -7,7 +7,7 @@ forms on the latest closed candle.
 """
 
 import logging
-import time
+import re
 import pandas as pd
 from freqtrade.strategy import IStrategy
 from datetime import datetime
@@ -23,6 +23,65 @@ except ImportError:
     smc = None
 
 logger = logging.getLogger(__name__)
+
+
+def pine_swing_highs_lows(dataframe: pd.DataFrame, size: int = 50) -> pd.DataFrame:
+    """
+    Replicates the swing high/low logic of the LuxAlgo 'Smart Money Concepts'
+    Pine indicator (getCurrentStructure).
+
+    A pivot at bar j is confirmed once `size` bars have followed it:
+      swing-high candidate: high[j] > max(high[j+1 .. j+size])
+      swing-low candidate:  low[j]  < min(low[j+1  .. j+size])
+    A leg state machine (starting bearish) alternates highs and lows; a swing is
+    recorded only when the leg flips (0 <-> 1). Same-direction confirmed pivots
+    within a leg are ignored, and no synthetic swings are added at the ends.
+
+    Returns a DataFrame with columns 'HighLow' (1 = swing high, -1 = swing low,
+    NaN otherwise) and 'Level' (the pivot price) - the same format
+    smc.swing_highs_lows() produces, so smc.ob() can consume it directly.
+    """
+    high = dataframe["high"].to_numpy(dtype=float)
+    low = dataframe["low"].to_numpy(dtype=float)
+    n = len(high)
+    size = int(size)
+
+    highlow = np.full(n, np.nan, dtype=np.float64)
+    level = np.full(n, np.nan, dtype=np.float64)
+
+    if n <= size + 1:
+        return pd.DataFrame({"HighLow": highlow, "Level": level})
+
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    # For every bar j with j+size < n: max/min of the next `size` bars (j+1..j+size)
+    next_high_max = sliding_window_view(high[1:], size).max(axis=1)
+    next_low_min = sliding_window_view(low[1:], size).min(axis=1)
+
+    high_candidate = high[: n - size] > next_high_max
+    low_candidate = low[: n - size] < next_low_min
+
+    # Legacy state machine over "current bars" i; pivot j = i - size gets recorded
+    # when the leg flips. leg: 0 = bearish, 1 = bullish (mirrors Pine's constants).
+    leg = 0
+    for i in range(size, n):
+        j = i - size
+        if high_candidate[j]:
+            new_leg = 0
+        elif low_candidate[j]:
+            new_leg = 1
+        else:
+            new_leg = leg
+        if new_leg != leg:
+            if new_leg == 1:  # 0 -> 1: last leg was down, a swing LOW was made
+                highlow[j] = -1.0
+                level[j] = low[j]
+            else:             # 1 -> 0: a swing HIGH was made
+                highlow[j] = 1.0
+                level[j] = high[j]
+        leg = new_leg
+
+    return pd.DataFrame({"HighLow": highlow, "Level": level})
 
 class SMCAlert(BaseModel):
     """
@@ -59,7 +118,9 @@ class SMC_Notifier(IStrategy):
     # Processing options
     process_only_new_candles = True
     use_exit_signal = False
-
+    timeframe = '15m'
+    informative_timeframe = '5m'
+    
     # Minimal ROI and Stoploss (Placeholders required by Freqtrade IStrategy)
     minimal_roi = {
         "0": 100
@@ -72,6 +133,11 @@ class SMC_Notifier(IStrategy):
     # when a pair keeps producing candidate gaps. FVG detection intentionally uses
     # the forming (unfinished) candle, so alerts can repaint by design.
     fvg_pair_cooldown_seconds = 300  # 5 minutes
+
+    # Number of bars used to confirm a swing high/low (Pine 'swingsLengthInput',
+    # the LuxAlgo indicator default). A pivot at bar j is confirmed once `swing_size`
+    # candles have followed it without exceeding it.
+    swing_size = 50
 
     # --- Score configuration (0-100, see _compute_pair_score) -----------------
     # Weights express the priority of each component (sum = 1.0).
@@ -99,6 +165,10 @@ class SMC_Notifier(IStrategy):
         # Last printed scoreboard string, to avoid re-printing identical tables.
         self._last_scoreboard: str | None = None
 
+    def informative_pairs(self):
+        pairs = self.dp.current_whitelist()
+        return [(pair, self.informative_timeframe) for pair in pairs]
+
     def populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
         """
         Calculates Fair Value Gaps using the smartmoneyconcepts library and fires
@@ -112,9 +182,48 @@ class SMC_Notifier(IStrategy):
             return dataframe
         
         pair = metadata.get('pair', 'Unknown Pair')
-        
-        fvg_df = smc.fvg(dataframe)
-        swing_df = smc.swing_highs_lows(dataframe, swing_length=5)
+
+        # ---------------------------------------------------------------------
+        # 5m timeframe FVG counts (informative)
+        # ---------------------------------------------------------------------
+        inf_tf = self.informative_timeframe
+
+        # NOTE: freqtrade's merge_informative_pair() (a standalone helper since
+        # 2026.7, no longer an IStrategy method) rejects a FASTER informative
+        # timeframe - and our 5m informative is faster than the 15m base. So we
+        # aggregate the 5m FVG counts into base-timeframe buckets manually.
+        informative_df = self.dp.get_pair_dataframe(pair=pair, timeframe=inf_tf)
+        if not informative_df.empty:
+            fvg_df = smc.fvg(informative_df)
+
+            # A FVG is "confirmed" when fvg() assigns it 1/-1, i.e. the confirming
+            # candle (via shift(-1)) exists. FVGs are "unmitigated" when the gap is
+            # not yet filled: the library uses MitigatedIndex == 0 for that (positive
+            # index = filled by a later candle, NaN = no FVG at that row).
+            unmitigated = fvg_df['MitigatedIndex'] == 0
+            informative_df['bullish_fvg_count'] = (
+                (fvg_df['FVG'] == 1) & unmitigated).astype(int)
+            informative_df['bearish_fvg_count'] = (
+                (fvg_df['FVG'] == -1) & unmitigated).astype(int)
+            base_minutes = int(pd.Timedelta(self.timeframe).total_seconds() // 60)
+            aggregated = informative_df.resample(
+                f"{base_minutes}min", on='date'
+            )[['bullish_fvg_count', 'bearish_fvg_count']].sum().reset_index()
+            dataframe = pd.merge(dataframe, aggregated, on='date', how='left')
+        else:
+            dataframe['bullish_fvg_count'] = 0
+            dataframe['bearish_fvg_count'] = 0
+
+        # Merge rows that predate the informative data are NaN -> 0.
+        dataframe['bullish_fvg_count'] = dataframe['bullish_fvg_count'].fillna(0)
+        dataframe['bearish_fvg_count'] = dataframe['bearish_fvg_count'].fillna(0)
+        # Total confirmed, unmitigated FVGs (both directions) per base candle.
+        dataframe['fvg_total_count'] = (
+            dataframe['bullish_fvg_count'] + dataframe['bearish_fvg_count'])
+
+        #fvg_df = smc.fvg(dataframe)
+        # Pine-style (LuxAlgo) swing high/low detection - see pine_swing_highs_lows.
+        swing_df = pine_swing_highs_lows(dataframe, size=self.swing_size)
         ob_df = smc.ob(dataframe, swing_df)
 
         # Define lookback window
@@ -148,61 +257,21 @@ class SMC_Notifier(IStrategy):
         ) * 100
 
         # ---------------------------------------------------------------------
-        # Fair Value Gap (FVG) Detection
-        # ---------------------------------------------------------------------
-
-        # Merge FVG results back to main dataframe
-        dataframe['fvg_type'] = fvg_df['FVG']
-        dataframe['fvg_top'] = fvg_df['Top']
-        dataframe['fvg_bottom'] = fvg_df['Bottom']
-        # Calculate gap size percentage for context in notifications
-        dataframe['fvg_percentage'] = (dataframe['fvg_top'] - dataframe['fvg_bottom']) / dataframe['fvg_bottom'] * 100
-
-        dataframe['ob_type'] = ob_df['OB']
-
-        # Count how many occurred within the window (confirmed = both directions)
-        dataframe['bullish_fvg_count'] = (dataframe['fvg_type'] == 1).astype(int).rolling(window=n).sum()
-        dataframe['bullish_ob_count'] = (dataframe['ob_type'] == 1).astype(int).rolling(window=n).sum()
-        dataframe['fvg_total_count'] = (dataframe['fvg_type'].abs() == 1).astype(int).rolling(window=n).sum()
-        dataframe['ob_total_count'] = (dataframe['ob_type'].abs() == 1).astype(int).rolling(window=n).sum()
-
-        # Detect forming FVG on c1 and c2 candles, c3 is in progress        
-        c1 = dataframe.iloc[-2]
-        c2 = dataframe.iloc[-1]
-
-        c1_high = c1['high']
-        c1_low = c1['low']
-        c2_close = c2['close']
-
-        possible_bullish_fvg = c2_close > c1_high
-        #possible_bearish_fvg = c2_close < c1_low
-        #forming_fvg = bool(possible_bullish_fvg or possible_bearish_fvg)
-        forming_fvg = possible_bullish_fvg
-        #if forming_fvg:
-            # if c2_close > c1_high:
-            #     gap_pct = (c2_close - c1_high) / c1_high * 100
-            #     direction = "bullish"
-            # else:
-            #     gap_pct = (c1_low - c2_close) / c1_low * 100
-            #     direction = "bearish"
-            #fvg_gap_percentage = (c2_close - c1_high) / c1_high * 100
-            #direction = "bullish"
-        fvg_gap_percentage = (c2_close - c1_high) / c1_high * 100 if forming_fvg else 0.0
-
-        # ---------------------------------------------------------------------
         # Per-pair scoreboard metric
         # ---------------------------------------------------------------------
-        ob_count = int(dataframe['ob_total_count'].iloc[-1])
-        fvg_count = int(dataframe['fvg_total_count'].iloc[-1])
+
+        # Count of confirmed, unmitigated FVGs during the last CLOSED base candle
+        # (iloc[-2]; iloc[-1] is the still-forming candle).
+        fvg_count = int(dataframe['fvg_total_count'].iloc[-2])
         ratio = float(dataframe['swing_range_percentage'].iloc[-1])
-        score = self._compute_pair_score(forming_fvg, ob_count, fvg_count, ratio)
+        high = float(dataframe['latest_swing_high'].iloc[-1])
+        low = float(dataframe['latest_swing_low'].iloc[-1])
         self.pair_metrics[pair] = {
             'pair': pair,
-            'score': round(score, 2),
-            'forming_fvg': fvg_gap_percentage,
-            'ob_count': ob_count,
             'fvg_count': fvg_count,
             'ratio': round(ratio, 2),
+            'high': high,
+            'low': low,
         }
 
         return dataframe
@@ -233,48 +302,24 @@ class SMC_Notifier(IStrategy):
 
         return ny_string
 
-    def _compute_pair_score(self, forming_fvg: bool, ob_count: int, fvg_count: int, ratio: float) -> float:
-        """
-        Weighted score in [0, 100].
-
-        Each component is normalized to [0, 1] before being multiplied by its weight:
-          - forming FVG (0 or 1)                            * 0.30  immediate trigger
-          - min(ob_count / score_ob_cap, 1)   confirmed OBs * 0.35  strongest anchor
-          - min(fvg_count / score_fvg_cap, 1) confirmed FVGs * 0.20  confluence
-          - min(ratio / score_range_ref, 1)   swing range % * 0.15  volatility context
-
-        A score near 100 only happens when ALL components are strong, matching the
-        "textbook strongest setup" (OB + confirmed FVGs + forming FVG + wide range).
-        """
-        c_forming = 1.0 if forming_fvg else 0.0
-        c_ob = min(ob_count / self.score_ob_cap, 1.0)
-        c_fvg = min(fvg_count / self.score_fvg_cap, 1.0)
-        c_range = min(ratio / self.score_range_ref, 1.0) if ratio == ratio else 0.0
-        return 100.0 * (
-            c_forming * self.score_weight_forming
-            + c_ob * self.score_weight_ob
-            + c_fvg * self.score_weight_fvg
-            + c_range * self.score_weight_range
-        )
-
     def _print_scoreboard(self) -> None:
         """
-        Prints the per-pair SMC scoreboard as a table (tabulate), sorted by score.
+        Prints the per-pair SMC scoreboard as a table (tabulate), sorted by forming_fvg.
         Skips re-printing when nothing changed since the last loop, to avoid log spam.
         """
+        pair_pattern = re.compile('/.*')
         rows = []
-        for m in sorted(self.pair_metrics.values(), key=lambda x: x['score'], reverse=True):
+        for m in sorted(self.pair_metrics.values(), key=lambda x: ( x['ratio'], x['fvg_count']), reverse=True):
+            short_pair = pair_pattern.sub('', m['pair'])
             rows.append([
-                m['pair'],
-                f"{m['score']:.2f}",
-                f"{m['forming_fvg']:.2f}",
-                m['ob_count'],
-                m['fvg_count'],
+                short_pair,
                 f"{m['ratio']:.2f}",
+                f"{m['fvg_count']}",                
+                f"{m['high']}/{m['low']}",                
             ])
         table = tabulate(
             rows,
-            headers=["Pair", "Score", "Forming FVG", "OBs", "FVGs", "Ratio"],
+            headers=["Pair", "Ratio", "FVG", "High/Low"],
             tablefmt="github",
         )
         if table == self._last_scoreboard:
