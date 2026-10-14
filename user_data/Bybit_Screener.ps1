@@ -26,6 +26,8 @@ if (-not (Test-Path -LiteralPath $Config)) {
 $env:FREQTRADE__EXCHANGE__NAME = 'bybit'
 $env:FREQTRADE__EXCHANGE__KEY = $env:BYBIT_DEMO_API_KEY
 $env:FREQTRADE__EXCHANGE__SECRET = $env:BYBIT_DEMO_API_SECRET
+# Use Bybit futures market for perpetual contracts (USDT-margined)
+$env:FREQTRADE__EXCHANGE__MARKET_TYPE = 'futures'
 
 # Force UTF-8 console output: the 'smartmoneyconcepts' package prints a unicode
 # banner at import that crashes under the default Windows cp1252 encoding.
@@ -40,7 +42,7 @@ Set-Location -LiteralPath $ProjectRoot
 # if activation was blocked (e.g. by execution policy).
 
 # Optional: scoreboard_sort_order can be passed as first positional argument (volume|ratio)
-$ScoreboardSortOrder = "volume"
+$ScoreboardSortOrder = "ratio"
 $ExtraArgs = @()
 foreach ($a in $args) {
     $ExtraArgs += $a

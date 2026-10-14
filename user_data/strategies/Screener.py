@@ -49,6 +49,11 @@ def _format_volume(vol: float | None) -> str:
     return f"{vol:.0f}"
 
 
+def _format_mcap(mcap: float | None) -> str:
+    """Format a CoinGecko market cap for the scoreboard. Reuses volume formatting."""
+    return _format_volume(mcap)
+
+
 def _wma(series: pd.Series, length: int) -> pd.Series:
     """Weighted moving average matching Pine's ta.wma (most recent value has the largest weight)."""
     if length < 1:
@@ -218,7 +223,7 @@ class Screener(IStrategy):
     # Processing options
     process_only_new_candles = True
     use_exit_signal = False
-    timeframe = '1h'
+    timeframe = '15m'
     
     # Minimal ROI and Stoploss (Placeholders required by Freqtrade IStrategy)
     minimal_roi = {
@@ -262,6 +267,19 @@ class Screener(IStrategy):
     # Scoreboard sort order: 'ratio' or 'volume'. Defaults to 'ratio'.
     scoreboard_sort_order = 'ratio'
 
+    plot_config = {
+        "main_plot": {
+            "trama": {},
+            "hma": {},
+        },
+        "subplots": {
+            "MACD": {
+                "macd": {},
+                "macdsignal": {},
+            },
+        },
+    }
+
     def __init__(self, config: dict) -> None:
         super().__init__(config)
         if smc is None:
@@ -292,6 +310,414 @@ class Screener(IStrategy):
         # pair, so a single cross produces exactly one notification.
         self._last_hma_cross_alert: dict[str, pd.Timestamp] = {}
         self._last_macd_cross_alert: dict[str, pd.Timestamp] = {}
+        # CoinGecko market caps per pair (e.g. {"BTC/USDT": 2.1e12}), loaded once
+        # at startup via _load_market_caps_once() and reused by _print_scoreboard.
+        self._market_caps: dict[str, float] = {}
+        self._market_caps_loaded: bool = False
+        # Cached GET /coins/list result: symbol.lower() -> [coingecko ids].
+        # Cached so later batches for newly-seen pairs don't refetch the list.
+        self._coingecko_symbol_to_ids: dict[str, list[str]] | None = None
+        # Base symbols already proven unresolvable (no id, or markets returned
+        # no mcap). Skipped on later loops to avoid log/API spam; the cached
+        # /coins/list won't change within one bot run anyway.
+        self._mcap_unresolved_bases: set[str] = set()
+        self._mcap_probed: bool = False
+
+    # ------------------------------------------------------------------
+    # CoinGecko market caps (loaded once at startup, reused by scoreboard)
+    # ------------------------------------------------------------------
+    def _coingecko_base_url(self) -> str:
+        """CoinGecko API base URL from env, defaulting to the public v3 API."""
+        url = (
+            os.environ.get('COINGECKO_API_URL')
+            or os.environ.get('COINGECKO_BASE_URL')
+            or os.environ.get('CG_API_URL')
+            or "https://api.coingecko.com/api/v3"
+        )
+        return str(url).strip().rstrip('/')
+
+    def _coingecko_api_key(self) -> str | None:
+        """CoinGecko API key from env (demo or pro). Returns None when unset."""
+        key = (
+            os.environ.get('COINGECKO_API_KEY')
+            or os.environ.get('COINGECKO_DEMO_API_KEY')
+            or os.environ.get('CG_API_KEY')
+            or os.environ.get('X_CG_DEMO_API_KEY')
+            or os.environ.get('X_CG_PRO_API_KEY')
+        )
+        if key is not None:
+            key = str(key).strip()
+            return key or None
+        return None
+
+    def _coingecko_headers(self) -> dict:
+        """Auth header for CoinGecko - exactly ONE header matching the base URL.
+
+        Sending a demo key in the pro header slot (or vice versa) makes
+        CoinGecko reject even valid /coins/markets calls with HTTP 400, so we
+        never send both. pro-api.coingecko.com -> x-cg-pro-api-key, everything
+        else -> x-cg-demo-api-key. Override with COINGECKO_KEY_TYPE=demo|pro.
+        """
+        key = self._coingecko_api_key()
+        if not key:
+            return {}
+        force = (os.environ.get('COINGECKO_KEY_TYPE') or '').strip().lower()
+        base = self._coingecko_base_url().lower()
+        if force == 'pro' or (not force and 'pro-api' in base):
+            return {"x-cg-pro-api-key": key}
+        return {"x-cg-demo-api-key": key}
+
+    def _screener_pairs_for_mcap(self) -> list[str]:
+        """All pairs whose market cap we want: whitelist + already-seen pairs."""
+        pairs: set[str] = set(self.notification_whitelist or [])
+        try:
+            cfg = self.config or {}
+            exch_whitelist = cfg.get('exchange', {}).get('pair_whitelist')
+            if isinstance(exch_whitelist, list):
+                pairs.update(exch_whitelist)
+            cfg_whitelist = cfg.get('pair_whitelist')
+            if isinstance(cfg_whitelist, list):
+                pairs.update(cfg_whitelist)
+        except Exception:
+            pass
+        try:
+            pairs.update(self.pair_metrics.keys())
+        except Exception:
+            pass
+        return sorted(p for p in pairs if isinstance(p, str) and p)
+
+    def _get_coingecko_symbol_to_ids(self) -> dict[str, list[str]] | None:
+        """
+        GET /coins/list once and cache symbol.lower() -> [ids].
+        Returns None on failure (caller logs and aborts that batch).
+        """
+        if self._coingecko_symbol_to_ids is not None:
+            return self._coingecko_symbol_to_ids
+        try:
+            import requests  # type: ignore
+        except ImportError:
+            logger.warning("CoinGecko: 'requests' package not installed, market caps unavailable.")
+            return None
+        base_url = self._coingecko_base_url()
+        headers = self._coingecko_headers()
+        if not self._coingecko_api_key():
+            logger.warning(
+                "CoinGecko: no API key found in env (COINGECKO_API_KEY / "
+                "COINGECKO_DEMO_API_KEY). Continuing unauthenticated with low rate limits."
+            )
+        logger.info(
+            f"CoinGecko: fetching /coins/list from {base_url} "
+            f"(key {'present' if headers else 'MISSING'})."
+        )
+        try:
+            resp = requests.get(f"{base_url}/coins/list", headers=headers, timeout=30)
+            resp.raise_for_status()
+            coin_list = resp.json()
+        except Exception as e:
+            status = getattr(getattr(e, 'response', None), 'status_code', None)
+            body = ""
+            try:
+                body = str(getattr(getattr(e, 'response', None), 'text', ''))[:300]
+            except Exception:
+                pass
+            logger.warning(f"CoinGecko: GET /coins/list failed (status={status}): {e} {body}")
+            return None
+        symbol_to_ids: dict[str, list[str]] = {}
+        try:
+            count = 0
+            for c in coin_list:
+                sym = str(c.get('symbol', '')).strip().lower()
+                cid = c.get('id')
+                if sym and cid:
+                    symbol_to_ids.setdefault(sym, []).append(str(cid))
+                    count += 1
+            logger.info(f"CoinGecko: /coins/list returned {count} coins ({len(symbol_to_ids)} symbols).")
+        except Exception as e:
+            logger.warning(f"CoinGecko: could not parse /coins/list response: {e}")
+            return None
+        self._coingecko_symbol_to_ids = symbol_to_ids
+        return symbol_to_ids
+
+    def _probe_coingecko_markets(self) -> None:
+        """Minimal 1-id markets call to tell auth/param errors apart from bad ids.
+
+        Logs (once per process) whether bitcoin-only query works with the
+        current base URL + header. If it works, the 400 comes from the ids
+        list; if it also 400s, the key/header/base-URL combo is wrong.
+        """
+        if getattr(self, '_mcap_probed', False):
+            return
+        self._mcap_probed = True
+        try:
+            import requests  # type: ignore
+            base_url = self._coingecko_base_url()
+            headers = self._coingecko_headers()
+            r = requests.get(
+                f"{base_url}/coins/markets",
+                params={
+                    "vs_currency": "usd",
+                    "ids": "bitcoin",
+                    "order": "market_cap_desc",
+                    "per_page": 1,
+                    "sparkline": "false",
+                },
+                headers=headers,
+                timeout=30,
+            )
+            r.raise_for_status()
+            logger.info("CoinGecko: probe ids=bitcoin OK - base URL/key/params are fine.")
+        except Exception as e:
+            resp = getattr(e, 'response', None)
+            status = getattr(resp, 'status_code', None)
+            body = ""
+            try:
+                body = str(getattr(resp, 'text', ''))[:500]
+            except Exception:
+                pass
+            header_names = sorted(self._coingecko_headers().keys())
+            logger.warning(
+                f"CoinGecko: probe ids=bitcoin also failed (status={status}): {e} "
+                f"body={body}. base={self._coingecko_base_url()} headers={header_names} "
+                "(demo keys only work with https://api.coingecko.com, pro keys only "
+                "with https://pro-api.coingecko.com; check COINGECKO_KEY_TYPE)."
+            )
+
+    def _fetch_mcaps_for_bases(self, bases: list[str]) -> dict[str, float]:
+        """
+        Batch GET /coins/markets?ids=... for the given base symbols.
+        Resolves each base via the cached /coins/list map, queries markets in
+        small chunks (<=50 ids so the URL stays short and one bad chunk can't
+        fail the whole batch), and returns base.lower() -> best market_cap.
+        Ambiguous symbols (many ids share e.g. 's', 'w') include every id and
+        keep the highest market_cap, which is the most-traded token.
+        """
+        import requests  # type: ignore
+        symbol_to_ids = self._get_coingecko_symbol_to_ids()
+        if not symbol_to_ids:
+            return {}
+        wanted = [b.strip().lower() for b in bases if b and b.strip()]
+        wanted = sorted(set(wanted))
+        if not wanted:
+            return {}
+        try:
+            chunk_size = int(os.environ.get('COINGECKO_MARKETS_CHUNK_SIZE', '50'))
+        except Exception:
+            chunk_size = 50
+        chunk_size = max(10, min(100, chunk_size))
+        try:
+            max_ids_per_symbol = int(os.environ.get('COINGECKO_MAX_IDS_PER_SYMBOL', '25'))
+        except Exception:
+            max_ids_per_symbol = 25
+        max_ids_per_symbol = max(5, min(100, max_ids_per_symbol))
+        candidate_ids: list[str] = []
+        missing: list[str] = []
+        dup_info: dict[str, int] = {}
+        truncated: dict[str, int] = {}
+        for base in wanted:
+            ids = symbol_to_ids.get(base)
+            if not ids:
+                missing.append(base.upper())
+            else:
+                dup_info[base] = len(ids)
+                if len(ids) > max_ids_per_symbol:
+                    truncated[base] = len(ids)
+                    candidate_ids.extend(ids[:max_ids_per_symbol])
+                else:
+                    candidate_ids.extend(ids)
+        if missing:
+            logger.warning(f"CoinGecko: no CoinGecko id found for symbols: {sorted(missing)}")
+        if truncated:
+            logger.warning(
+                "CoinGecko: capping ids per symbol to "
+                f"{max_ids_per_symbol} (raise via COINGECKO_MAX_IDS_PER_SYMBOL): {truncated}."
+            )
+        noisy = {k: v for k, v in dup_info.items() if v > 20}
+        if noisy:
+            logger.warning(
+                "CoinGecko: highly ambiguous symbols (many ids share the ticker, "
+                f"keeping highest mcap each): {noisy}. Results for these may be approximate."
+            )
+        seen: set[str] = set()
+        uniq_ids: list[str] = []
+        for cid in candidate_ids:
+            if cid not in seen:
+                seen.add(cid)
+                uniq_ids.append(cid)
+        if not uniq_ids:
+            return {}
+        base_url = self._coingecko_base_url()
+        headers = self._coingecko_headers()
+        wanted_set = set(wanted)
+        best: dict[str, float] = {}
+        n_chunks = (len(uniq_ids) + chunk_size - 1) // chunk_size
+        for ci in range(n_chunks):
+            chunk = uniq_ids[ci * chunk_size:(ci + 1) * chunk_size]
+            # NOTE: sparkline must be lowercase "false" string - Python False
+            # encodes as "False" and CoinGecko rejects it with HTTP 400.
+            params = {
+                "vs_currency": "usd",
+                "ids": ",".join(chunk),
+                "order": "market_cap_desc",
+                "per_page": len(chunk),
+                "sparkline": "false",
+            }
+            if n_chunks > 1:
+                logger.info(
+                    f"CoinGecko: /coins/markets chunk {ci + 1}/{n_chunks} ({len(chunk)} ids)."
+                )
+            try:
+                r2 = requests.get(
+                    f"{base_url}/coins/markets", params=params, headers=headers, timeout=30
+                )
+                r2.raise_for_status()
+            except Exception as e:
+                resp = getattr(e, 'response', None)
+                status = getattr(resp, 'status_code', None)
+                body = ""
+                try:
+                    body = str(getattr(resp, 'text', ''))[:500]
+                except Exception:
+                    pass
+                logger.warning(
+                    f"CoinGecko: /coins/markets chunk {ci + 1}/{n_chunks} failed "
+                    f"(status={status}, {len(chunk)} ids): {e} body={body}. "
+                    "Continuing with other chunks."
+                )
+                if ci == 0 and status == 400:
+                    # All chunks share the same params/headers, so a 400 on the
+                    # very first chunk is systematic (bad header/key/param), not
+                    # a bad id. Probe with a single known id to isolate it.
+                    self._probe_coingecko_markets()
+                continue
+            try:
+                payload = r2.json()
+            except Exception as e:
+                logger.warning(f"CoinGecko: could not parse /coins/markets chunk {ci + 1}: {e}")
+                continue
+            for m in payload:
+                try:
+                    sym = str(m.get('symbol', '')).strip().lower()
+                    mcap = m.get('market_cap')
+                except Exception:
+                    continue
+                if not sym or sym not in wanted_set or mcap is None:
+                    continue
+                try:
+                    mcap_f = float(mcap)
+                except (TypeError, ValueError):
+                    continue
+                if sym not in best or mcap_f > best[sym]:
+                    best[sym] = mcap_f
+        unresolved = sorted(b.upper() for b in wanted if b not in best)
+        if unresolved:
+            logger.warning(
+                f"CoinGecko: /coins/markets returned no market_cap for: {unresolved}. "
+                "Ticker is likely ambiguous or the coin is untracked."
+            )
+        return best
+
+    def _load_market_caps_once(self, force: bool = False) -> None:
+        """
+        Fetch CoinGecko market caps for the startup universe and cache them in
+        ``self._market_caps`` (pair -> market_cap in USD).
+
+        Flow:
+          1. GET /coins/list -> map each screener base symbol (e.g. BTC from
+             BTC/USDT) to CoinGecko's internal id.
+          2. Single GET /coins/markets?ids=<comma-joined ids> -> market_cap.
+        Results are reused by _print_scoreboard; failures only log warnings
+        and never raise, so the strategy keeps running without Mcap data.
+        Pairs discovered later (pair_metrics) are filled in by
+        _ensure_market_caps_for_current_pairs(), which reuses the cached
+        /coins/list and only queries markets for the missing symbols.
+        """
+        if self._market_caps_loaded and not force:
+            return
+        pairs = self._screener_pairs_for_mcap()
+        if not pairs:
+            logger.warning("CoinGecko: no screener pairs found, skipping market-cap load.")
+            return
+        base_to_pairs: dict[str, list[str]] = {}
+        for pair in pairs:
+            try:
+                base = re.split(r'[/:]', pair)[0].strip().lower()
+            except Exception:
+                continue
+            if base:
+                base_to_pairs.setdefault(base, []).append(pair)
+        try:
+            best = self._fetch_mcaps_for_bases(list(base_to_pairs.keys()))
+        except Exception as e:
+            logger.warning(f"CoinGecko: market-cap load failed: {e}")
+            return
+        loaded = 0
+        for base, plist in base_to_pairs.items():
+            mcap = best.get(base)
+            if mcap is not None:
+                for p in plist:
+                    self._market_caps[p] = mcap
+                    loaded += 1
+            else:
+                self._mcap_unresolved_bases.add(base)
+        self._market_caps_loaded = True
+        logger.info(
+            f"CoinGecko: loaded market caps for {loaded}/{len(pairs)} pairs "
+            f"({len(best)} symbols with mcap)."
+        )
+
+    def _ensure_market_caps_for_current_pairs(self) -> None:
+        """
+        Fill gaps for pairs seen in pair_metrics after startup (the scoreboard
+        universe is dynamic). Only the missing base symbols are queried, in one
+        /coins/markets batch; everything already cached is reused untouched.
+        Symbols proven unresolvable are skipped via _mcap_unresolved_bases so a
+        bot loop every few seconds does not spam the API/logs.
+        """
+        try:
+            missing_pairs = [p for p in self.pair_metrics if p not in self._market_caps]
+        except Exception:
+            return
+        if not missing_pairs:
+            return
+        base_to_pairs: dict[str, list[str]] = {}
+        for pair in missing_pairs:
+            try:
+                base = re.split(r'[/:]', pair)[0].strip().lower()
+            except Exception:
+                continue
+            if base and base not in self._mcap_unresolved_bases:
+                base_to_pairs.setdefault(base, []).append(pair)
+        if not base_to_pairs:
+            return
+        logger.info(
+            f"CoinGecko: fetching market caps for {len(missing_pairs)} newly-seen pairs "
+            f"({len(base_to_pairs)} symbols)."
+        )
+        try:
+            best = self._fetch_mcaps_for_bases(list(base_to_pairs.keys()))
+        except Exception as e:
+            logger.warning(f"CoinGecko: gap-fill market-cap load failed: {e}")
+            return
+        n = 0
+        for base, plist in base_to_pairs.items():
+            mcap = best.get(base)
+            if mcap is not None:
+                for p in plist:
+                    self._market_caps[p] = mcap
+                    n += 1
+            else:
+                # No id or no mcap with the cached /coins/list -> retrying every
+                # loop would never succeed, so remember and stay quiet next time.
+                self._mcap_unresolved_bases.add(base)
+        if n:
+            logger.info(f"CoinGecko: gap-filled market caps for {n}/{len(missing_pairs)} pairs.")
+
+    def bot_start(self, **kwargs) -> None:
+        """Called once after bot instantiation: fetch market caps a single time."""
+        try:
+            self._load_market_caps_once()
+        except Exception as e:
+            logger.warning(f"CoinGecko: unexpected error loading market caps at startup: {e}")
 
     def _check_hma_trama_cross(self, pair: str, dataframe: pd.DataFrame) -> None:
         """
@@ -391,7 +817,8 @@ class Screener(IStrategy):
             
 
         # Pine-style (LuxAlgo) swing high/low detection - see pine_swing_highs_lows.
-        swing_df = pine_swing_highs_lows(dataframe, size=self.swing_size)
+        swing_df = pine_swing_highs_lows(dataframe, self.swing_size)
+        #swing_df = swing_highs_lows(dataframe, self.swing_size)
 
 
         # ---------------------------------------------------------------------
@@ -495,16 +922,17 @@ class Screener(IStrategy):
             short_pair = re.sub('/.*', '', m['pair'])
             rows.append([
                 short_pair,
-                _format_volume(self._vol24h.get(m['pair'])),
                 f"{m['ratio']:.2f}",
+                _format_mcap(self._market_caps.get(m['pair'])),
+                _format_volume(self._vol24h.get(m['pair'])),                
                 f"{m['high']}/{m['low']}",
-                
+
             ])
 
         if rows:
             frame = tabulate(
                 rows,
-                headers=["Pair", "24H Vol", "Ratio", "High/Low"],
+                headers=["Pair", "Ratio", "Mcap", "24H Vol","High/Low"],
                 tablefmt="github",
             )
             #frame = self._apply_ratio_highlight(frame, rows)
@@ -583,6 +1011,16 @@ class Screener(IStrategy):
         #    return
         
         if self.dp and self.dp.runmode.value in ('live', 'dry_run'):
+            # Startup batch runs once in bot_start; the scoreboard universe is
+            # dynamic (pair_metrics fills in later), so gap-fill any newly-seen
+            # pairs here. Cached values are reused; only missing symbols trigger
+            # one extra /coins/markets batch.
+            try:
+                if not self._market_caps_loaded:
+                    self._load_market_caps_once()
+                self._ensure_market_caps_for_current_pairs()
+            except Exception as e:
+                logger.warning(f"CoinGecko: lazy market-cap load failed: {e}")
             # Refresh 24h quote volume once per bot loop and cache it, so the
             # scoreboard never triggers repeated network calls. dp.ticker()
             # returns {} on error; the previous value is then kept.
